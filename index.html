@@ -51,6 +51,9 @@ const CONFIG = {
   REFRESH_AFTER_MIN: 10,    // refetch when you come back to the page after this long
   TIMEZONE: 'Pacific/Auckland',
 };
+
+// Filled in automatically each time the page is published. Leave this line as it is.
+const VERSION = 'dev';
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Tennis weather</title>
@@ -489,7 +492,8 @@ function renderFooter() {
     `Playable = wind under ${c.MAX_WIND_KMH} and gusts under ${c.MAX_GUST_KMH} km/h, rain under ${c.RAIN_MM} mm ` +
     `with chance under ${c.MAX_RAIN_CHANCE}%, and a dry court, inside your hours. ` +
     `Days ${c.TENTATIVE_FROM_DAY}–${c.FORECAST_DAYS} are tentative. ` +
-    'Weather data by <a href="https://open-meteo.com/">Open-Meteo.com</a>.';
+    'Weather data by <a href="https://open-meteo.com/">Open-Meteo.com</a>. ' +
+    (VERSION === 'dev' ? 'Unpublished copy.' : `Version ${esc(VERSION)}.`);
 }
 
 // ------------------------------------------------------------------------ data
