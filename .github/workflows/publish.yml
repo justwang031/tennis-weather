@@ -2,7 +2,8 @@ name: Check and publish
 
 # Every change to main is checked, and only a change that passes is published,
 # under the next version number. "Run workflow" with a version number puts that
-# version of index.html back, as a new version. Pull requests are only checked.
+# version's page (and the check that went with it) back, as a new version.
+# Pull requests are only checked.
 
 on:
   push:
@@ -31,6 +32,13 @@ jobs:
       sha: ${{ steps.pin.outputs.sha }}
       restore: ${{ steps.pin.outputs.restore }}
     steps:
+      # Publishing only happens from main, so say so instead of ending with a green tick.
+      - name: Run workflow only works on main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Nothing was published, because the branch box was not left on main. Tap Run workflow again and leave it on main."
+          exit 1
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -47,16 +55,19 @@ jobs:
             if ! printf '%s\n' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+'; then
               echo "::error::That is not a version number. Type it like v1.0"; exit 1
             fi
-            if ! git cat-file -e "refs/tags/$tag:index.html" 2>/dev/null; then
+            if ! git cat-file -e "refs/tags/$tag:index.html" 2>/dev/null || ! git cat-file -e "refs/tags/$tag:checks/check.mjs" 2>/dev/null; then
               echo "::error::There is no version called $tag. The Releases page lists them."; exit 1
             fi
-            # Only this run's working copy changes here; nothing is pushed yet.
-            git checkout "refs/tags/$tag" -- index.html
+            # A page is checked by the check that was published with it. Only this
+            # run's working copy changes here; nothing is pushed yet.
+            git checkout "refs/tags/$tag" -- index.html checks/check.mjs
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "restore=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Check the page
+        env:
+          RESTORING: ${{ steps.pin.outputs.restore }}
         run: node checks/check.mjs
 
   publish:
@@ -88,13 +99,13 @@ jobs:
           set -euo pipefail
           last=$(git tag --list 'v*' --sort=-v:refname | { grep -Ex 'v[0-9]+\.[0-9]+' || true; } | sed -n 1p)
           if [ -n "$last" ] && ! git merge-base --is-ancestor "$last" HEAD; then
-            echo "::error::This run is older than $last, which is already published. Nothing was changed. To put an old version back, use Run workflow and type its number."
+            echo "::error::This run is older than $last, so nothing was changed. To put a version back, or to try publishing again, use Run workflow."
             exit 1
           fi
 
           restored=
           if [ -n "$RESTORE" ]; then
-            git checkout "refs/tags/$RESTORE" -- index.html
+            git checkout "refs/tags/$RESTORE" -- index.html checks/check.mjs
             if ! git diff --cached --quiet; then
               git -c user.name="github-actions[bot]" \
                   -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
@@ -134,12 +145,16 @@ jobs:
           grep -qF "const VERSION = '$STAMP';" _site/index.html || {
             echo "::error::index.html has no VERSION line to stamp"; exit 1; }
 
+      # Named per attempt: a re-run would otherwise trip over the first attempt's upload.
       - uses: actions/upload-pages-artifact@v5
         with:
+          name: github-pages-${{ github.run_attempt }}
           path: _site
 
       - id: deploy
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
 
       - name: Record the version in Releases
         env:
@@ -147,5 +162,9 @@ jobs:
           V: ${{ steps.version.outputs.v }}
           LAST: ${{ steps.version.outputs.last }}
         run: |
-          notes=$(git log --format='- %s' ${LAST:+"$LAST.."}HEAD | sed -n 1,50p)
+          # Notes run from the newest version on the Releases page, not from the newest
+          # tag: a tag whose publish failed half-way never got a release.
+          base=$(gh release list --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName // empty') || base=$LAST
+          if [ -n "$base" ] && ! git merge-base --is-ancestor "$base" HEAD 2>/dev/null; then base=$LAST; fi
+          notes=$(git log --format='- %s' ${base:+"$base.."}HEAD | sed -n 1,50p)
           gh release create "$V" --verify-tag --title "$V" --notes "${notes:-Published again with no changes.}"
