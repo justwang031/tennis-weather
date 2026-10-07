@@ -524,7 +524,7 @@ async function load() {
     state.fetchedMs = Date.now();
     const at = nzNow(CONFIG);
     state.fetchedDate = at.date;
-    state.fetchedLabel = fmtTime(att.min);
+    state.fetchedLabel = fmtTime(at.min);
   } catch (err) {
     state.error = err.message || String(err);
   }
