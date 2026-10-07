@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<script>
+// ============================================================================
+// SETTINGS — change these to tune the dashboard. Times are 24-hour, NZ time.
+// ============================================================================
+const CONFIG = {
+  // Clubs, left to right. "closes" is the latest you can play there;
+  // "closesOn" overrides it for single days ('sunset' = no lights that day).
+  CLUBS: [
+    { name: 'Talavera',   lat: -41.28579, lon: 174.75811, closes: '21:30', closesOn: {} },
+    { name: 'Lower Hutt', lat: -41.21543, lon: 174.91542, closes: '22:00', closesOn: { Sun: 'sunset' } },
+  ],
+
+  // When you are free to play. Delete a day's line to never play on it.
+  AVAILABILITY: {
+    Mon: ['17:30', '22:00'],
+    Tue: ['17:30', '22:00'],
+    Wed: ['17:00', '22:00'],
+    Thu: ['17:30', '22:00'],
+    Fri: ['17:00', '22:00'],
+    Sat: ['08:00', '22:00'],
+    Sun: ['08:00', '22:00'],
+  },
+
+  // An hour is playable only if every one of these holds.
+  MAX_WIND_KMH: 25,         // mean wind must be below this
+  MAX_GUST_KMH: 35,         // gusts must be below this
+  RAIN_MM: 0.1,             // rain in the hour must be below this
+  MAX_RAIN_CHANCE: 30,      // rain chance (%) must be below this
+
+  // Court drying: points the court needs after a wet spell, by the spell's total rain.
+  DRY_LIGHT_BELOW_MM: 1,    // total below this -> DRY_POINTS_LIGHT
+  DRY_HEAVY_ABOVE_MM: 5,    // total above this -> DRY_POINTS_HEAVY, in between -> DRY_POINTS_MEDIUM
+  DRY_POINTS_LIGHT: 1,
+  DRY_POINTS_MEDIUM: 2,
+  DRY_POINTS_HEAVY: 3,
+
+  // Court drying: points each following dry hour earns.
+  DRY_BASE: 1,
+  DRY_WIND_AT_KMH: 15,      DRY_WIND_BONUS: 0.5,     // wind at or above this
+  DRY_CLEAR_BELOW_PCT: 50,  DRY_CLEAR_BONUS: 0.5,    // cloud cover below this
+  DRY_HUMID_ABOVE_PCT: 85,  DRY_HUMID_PENALTY: 0.5,  // humidity above this
+  DRY_NIGHT_FACTOR: 0.5,    // multiplier for hours after sunset
+
+  TENTATIVE_FROM_DAY: 4,    // day 1 is today
+  FORECAST_DAYS: 7,
+  PAST_DAYS: 2,             // earlier days loaded so today's drying starts from real rain
+  REFRESH_AFTER_MIN: 10,    // refetch when you come back to the page after this long
+  TIMEZONE: 'Pacific/Auckland',
+};
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tennis weather</title>
+<meta name="theme-color" content="#f3f5f1" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1411" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Tennis">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23cfe83a'/%3E%3Cpath d='M8 14c12 8 12 28 0 36M56 14c-12 8-12 28 0 36' fill='none' stroke='%23fff' stroke-width='4'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f3f5f1; --card: #fff; --ink: #18211b; --muted: #5f6b63; --line: #dfe5df;
+  --accent: #1f7a45; --bad: #b3261e;
+  --good-bg: #e2f4e6; --good-ink: #17633a; --good-line: #b9e2c5;
+  --drying-bg: #fdf0d5; --drying-ink: #7a5200;
+  --rain-bg: #e1edfb; --rain-ink: #1f4f8f;
+  --risk-bg: #e6eff3; --risk-ink: #3d5a6b;
+  --wind-bg: #ece8f7; --wind-ink: #4f3d8a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1411; --card: #1a211c; --ink: #e9efe9; --muted: #9aa69e; --line: #2c362f;
+    --accent: #6fd596; --bad: #ff8a80;
+    --good-bg: #173a25; --good-ink: #8fe0aa; --good-line: #25573a;
+    --drying-bg: #3d2f0e; --drying-ink: #f1cb74;
+    --rain-bg: #14304f; --rain-ink: #9cc6f5;
+    --risk-bg: #1f3038; --risk-ink: #a7c6d4;
+    --wind-bg: #2b2548; --wind-ink: #c3b6f2;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+.wrap {
+  max-width: 720px; margin: 0 auto;
+  padding: calc(12px + env(safe-area-inset-top)) 12px calc(32px + env(safe-area-inset-bottom));
+}
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 2px 12px; }
+.top h1 { font-size: 1.25rem; margin: 0; }
+.top .updated { color: var(--muted); font-size: .8125rem; }
+.refresh {
+  min-height: 40px; padding: 0 16px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--card);
+}
+.refresh:disabled { opacity: .6; cursor: default; }
+
+.day { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin-bottom: 12px; }
+.day.today { border: 2px solid var(--accent); }
+.day > header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.day h2 { font-size: 1.0625rem; margin: 0; }
+.day .date { color: var(--muted); font-size: .875rem; }
+.badge {
+  margin-left: auto; font-size: .6875rem; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 8px; border-radius: 999px; border: 1px dashed var(--muted); color: var(--muted);
+}
+.clubs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.club { min-width: 0; }
+.club h3 { font-size: .8125rem; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+.wins { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.chip {
+  width: 100%; min-height: 44px; padding: 6px 10px; border-radius: 10px;
+  border: 1px solid var(--good-line); background: var(--good-bg); color: var(--good-ink);
+  font-weight: 700; text-align: left;
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+}
+.chip::after { content: "▾"; font-size: .75rem; opacity: .7; }
+.chip[aria-expanded="true"]::after { content: "▴"; }
+.chip[aria-expanded="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+.none { color: var(--muted); margin: 0; min-height: 44px; display: flex; align-items: center; }
+.next { color: var(--muted); font-size: .8125rem; margin: 2px 0 0; }
+.all {
+  margin-top: 4px; min-height: 36px; padding: 6px 0; border: 0; background: none;
+  color: var(--muted); font-size: .8125rem; text-decoration: underline;
+}
+.all[aria-expanded="true"] { color: var(--ink); font-weight: 600; }
+
+.detail { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; overflow-x: auto; }
+.detail h4 { margin: 0 0 4px; font-size: .9375rem; }
+table { width: 100%; border-collapse: collapse; font-size: .875rem; font-variant-numeric: tabular-nums; }
+th, td { padding: 6px 3px; text-align: right; vertical-align: top; border-top: 1px solid var(--line); }
+thead th { border-top: 0; color: var(--muted); font-size: .75rem; font-weight: 600; }
+tbody th { font-weight: 600; }
+thead th, td:not(:last-child) { white-space: nowrap; }
+th:first-child { text-align: left; padding-left: 0; }
+th:last-child, td:last-child { text-align: left; padding-left: 8px; padding-right: 0; }
+td small { display: block; color: var(--muted); font-size: .75rem; }
+.over { color: var(--bad); font-weight: 700; }
+.dim { color: var(--muted); }
+.pill {
+  display: inline-block; padding: 1px 8px; margin: 0 2px 2px 0; border-radius: 999px;
+  font-size: .75rem; font-weight: 700; white-space: nowrap;
+}
+.pill.good { background: var(--good-bg); color: var(--good-ink); }
+.pill.drying { background: var(--drying-bg); color: var(--drying-ink); }
+.pill.rain { background: var(--rain-bg); color: var(--rain-ink); }
+.pill.risk { background: var(--risk-bg); color: var(--risk-ink); }
+.pill.wind { background: var(--wind-bg); color: var(--wind-ink); }
+.pill.nodata { background: var(--line); color: var(--ink); }
+.note { color: var(--muted); font-size: .75rem; margin: 8px 0 0; }
+
+.state { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+.state p { margin: 0 0 8px; }
+.state p:last-child { margin-bottom: 0; }
+.state.error { border-color: var(--bad); }
+footer { color: var(--muted); font-size: .75rem; padding: 4px 2px; }
+footer a { color: inherit; }
+.pass { color: var(--good-ink); font-weight: 700; }
+.fail { color: var(--bad); font-weight: 700; }
+.tests td, .tests th { text-align: left; padding: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Tennis weather</h1>
+      <div class="updated" id="updated" aria-live="polite"></div>
+    </div>
+    <button class="refresh" id="refresh" type="button">Refresh</button>
+  </header>
+  <main id="app"><div class="state"><p>Loading forecast…</p></div></main>
+  <footer id="foot"></footer>
+  <noscript><p>This page needs JavaScript to load the forecast.</p></noscript>
+</div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------- time helpers
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// All times are NZ wall-clock: a 'YYYY-MM-DD' date plus minutes from midnight.
+const toMin = hhmm => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+const isoMin = iso => toMin(iso.slice(11, 16));
+const utcDate = date => new Date(date + 'T00:00:00Z');
+const dayName = date => DAY_NAMES[utcDate(date).getUTCDay()];
+
+function fmtDate(date) {
+  const d = utcDate(date);
+  return `${DAY_NAMES[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+}
+
+function fmtTime(min, suffix = true) {
+  const h = Math.floor(min / 60) % 24, m = min % 60;
+  return (h % 12 || 12) + (m ? ':' + String(m).padStart(2, '0') : '') + (suffix ? (h < 12 ? 'am' : 'pm') : '');
+}
+
+function fmtRange(start, end, fromNow) {
+  if (fromNow) return 'Now–' + fmtTime(end);
+  const sameHalf = (start < 720) === (end < 720);
+  return fmtTime(start, !sameHalf) + '–' + fmtTime(end);
+}
+
+// The NZ wall-clock date and minute of an instant.
+const nzFormats = {};
+function nzClock(when, cfg) {
+  const format = nzFormats[cfg.TIMEZONE] || (nzFormats[cfg.TIMEZONE] = new Intl.DateTimeFormat('en-NZ', {
+    timeZone: cfg.TIMEZONE, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }));
+  const p = Object.fromEntries(format.formatToParts(when).map(x => [x.type, x.value]));
+  return { date: `${p.year}-${p.month}-${p.day}`, min: (+p.hour % 24) * 60 + +p.minute };
+}
+const nzNow = cfg => nzClock(new Date(), cfg);
+
+// Open-Meteo stamps a whole response with the one UTC offset in force when it
+// is asked, so its labels for days across a daylight-saving change are an hour
+// off the real clock. Go back to the instant and read the NZ clock from that.
+function stamp(iso, loc, cfg) {
+  if (loc.utc_offset_seconds == null) return { date: iso.slice(0, 10), min: isoMin(iso) };
+  return nzClock(new Date(Date.parse(iso + ':00Z') - loc.utc_offset_seconds * 1000), cfg);
+}
+
+// ------------------------------------------------------------------- the rules
+
+// Open-Meteo reports rain, rain chance and gusts for the hour *ending* at each
+// timestamp, and wind, humidity and cloud as snapshots at it. A slot is one
+// clock hour, so it takes the former from the next row and averages the latter.
+function buildSlots(loc, cfg) {
+  const h = loc.hourly;
+  const sun = {};
+  loc.daily.time.forEach((d, i) => {
+    sun[d] = { rise: stamp(loc.daily.sunrise[i], loc, cfg).min, set: stamp(loc.daily.sunset[i], loc, cfg).min };
+  });
+  const mean = (a, i) => (a[i] == null || a[i + 1] == null ? null : (a[i] + a[i + 1]) / 2);
+  const slots = [];
+  for (let i = 0; i + 1 < h.time.length; i++) {
+    const { date, min: start } = stamp(h.time[i], loc, cfg), mid = start + 30;
+    const s = {
+      date, start,
+      wind: mean(h.wind_speed_10m, i),
+      gust: h.wind_gusts_10m[i + 1],
+      rain: h.precipitation[i + 1],
+      chance: h.precipitation_probability[i + 1],
+      humidity: mean(h.relative_humidity_2m, i),
+      cloud: mean(h.cloud_cover, i),
+      night: !sun[date] || mid < sun[date].rise || mid >= sun[date].set,
+    };
+    s.missing = [s.wind, s.gust, s.rain, s.chance, s.humidity, s.cloud].some(v => v == null);
+    slots.push(s);
+  }
+  return { slots, sun };
+}
+
+function pointsNeeded(mm, cfg) {
+  mm = Math.round(mm * 100) / 100;   // so 0.1 + 0.2 + 0.7 counts as exactly 1
+  if (mm < cfg.DRY_LIGHT_BELOW_MM) return cfg.DRY_POINTS_LIGHT;
+  if (mm > cfg.DRY_HEAVY_ABOVE_MM) return cfg.DRY_POINTS_HEAVY;
+  return cfg.DRY_POINTS_MEDIUM;
+}
+
+function dryingPoints(s, cfg) {
+  let p = cfg.DRY_BASE;
+  if (s.wind >= cfg.DRY_WIND_AT_KMH) p += cfg.DRY_WIND_BONUS;
+  if (s.cloud < cfg.DRY_CLEAR_BELOW_PCT) p += cfg.DRY_CLEAR_BONUS;
+  if (s.humidity > cfg.DRY_HUMID_ABOVE_PCT) p -= cfg.DRY_HUMID_PENALTY;
+  if (s.night) p *= cfg.DRY_NIGHT_FACTOR;
+  return Math.max(p, 0);
+}
+
+// Walks the slots in time order and sets s.court to 'wet', 'drying' or 'dry'.
+function applyDrying(slots, cfg) {
+  let raining = false, spellMm = 0, needed = 0, earned = 0;
+  for (const s of slots) {
+    if (s.missing) continue;
+    if (s.rain >= cfg.RAIN_MM) {
+      // Rain returning before the court has dried adds to the earlier spell.
+      if (!raining && earned >= needed) spellMm = 0;
+      raining = true;
+      spellMm += s.rain;
+      s.court = 'wet';
+      continue;
+    }
+    if (raining) {
+      raining = false;
+      needed = pointsNeeded(spellMm, cfg);
+      earned = 0;
+    }
+    if (earned < needed) {
+      // Points land at the end of the hour, so this hour is still drying.
+      earned += dryingPoints(s, cfg);
+      s.court = 'drying';
+      s.dryEarned = Math.min(earned, needed);
+      s.dryNeeded = needed;
+    } else {
+      s.court = 'dry';
+    }
+  }
+}
+
+// Why an hour is not playable ([] = good). Availability is handled by playSpan.
+function blockers(s, cfg) {
+  if (s.missing) return ['No data'];
+  const why = [];
+  if (s.wind >= cfg.MAX_WIND_KMH || s.gust >= cfg.MAX_GUST_KMH) why.push('Windy');
+  if (s.rain >= cfg.RAIN_MM) why.push('Rain');
+  else if (s.chance >= cfg.MAX_RAIN_CHANCE) why.push('Rain risk');
+  if (s.court === 'drying') why.push('Drying');
+  return why;
+}
+
+// The span you could play at a club on a date: your availability cut off at
+// the club's closing time. Null if there is none.
+function playSpan(date, club, sun, cfg) {
+  const day = dayName(date), mine = cfg.AVAILABILITY[day];
+  if (!mine) return null;
+  const closes = (club.closesOn && club.closesOn[day]) || club.closes;
+  const closeMin = closes === 'sunset' ? sun[date].set : toMin(closes);
+  const span = { start: toMin(mine[0]), end: Math.min(toMin(mine[1]), closeMin) };
+  return span.end > span.start ? span : null;
+}
+
+// Cuts a span into its hourly pieces and merges the playable ones into windows.
+function findWindows(daySlots, span, cfg) {
+  const hours = [], windows = [];
+  if (!span) return { hours, windows };
+  for (const s of daySlots) {
+    const start = Math.max(s.start, span.start), end = Math.min(s.start + 60, span.end);
+    if (end <= start) continue;
+    const hour = { start, end, slot: s, why: blockers(s, cfg) };
+    hours.push(hour);
+    if (hour.why.length) continue;
+    const last = windows[windows.length - 1];
+    if (last && last.end === start) { last.end = end; last.hours.push(hour); }
+    else windows.push({ start, end, hours: [hour] });
+  }
+  return { hours, windows };
+}
+
+// One club on one date. On today, only what is left from now.
+function clubDay(date, club, daySlots, sun, now, cfg) {
+  let span = playSpan(date, club, sun, cfg);
+  const started = !!span && date === now.date && now.min > span.start;
+  if (started) span = now.min < span.end ? { start: now.min, end: span.end } : null;
+  const out = findWindows(daySlots, span, cfg);
+  if (started && out.windows[0] && out.windows[0].start === now.min) out.windows[0].fromNow = true;
+  return { club, over: started && !span, ...out };
+}
+
+function buildModel(data, now, cfg) {
+  const locs = Array.isArray(data) ? data : [data];
+  const perClub = cfg.CLUBS.map((club, c) => {
+    const { slots, sun } = buildSlots(locs[c], cfg);
+    applyDrying(slots, cfg);
+    return { club, slots, sun };
+  });
+  const allDates = locs[0].daily.time;
+  const first = allDates.indexOf(now.date);
+  if (first < 0) return [];   // the loaded forecast no longer covers today
+  return allDates.slice(first, first + cfg.FORECAST_DAYS).map((date, d) => ({
+    date,
+    isToday: date === now.date,
+    tentative: d + 1 >= cfg.TENTATIVE_FROM_DAY,
+    clubs: perClub.map(({ club, slots, sun }) =>
+      clubDay(date, club, slots.filter(s => s.date === date), sun, now, cfg)),
+  }));
+}
+
+// ------------------------------------------------------------------- rendering
+const app = document.getElementById('app');
+const state = { data: null, error: null, loading: false, fetchedMs: 0, fetchedDate: '', fetchedLabel: '', open: new Map() };
+
+const esc = v => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const whole = v => (v == null ? '–' : Math.floor(v));
+const PILL_CLASS = { 'Windy': 'wind', 'Rain': 'rain', 'Rain risk': 'risk', 'Drying': 'drying', 'No data': 'nodata' };
+
+function courtText(s) {
+  if (s.court === 'wet') return 'court wet';
+  if (s.court === 'drying') return `drying ${+s.dryEarned.toFixed(2)} of ${s.dryNeeded} pts`;
+  return s.court === 'dry' ? 'court dry' : '';
+}
+
+function detailHtml(title, hours, cfg) {
+  const over = (bad, text) => (bad ? `<span class="over">${text}</span>` : text);
+  const rows = hours.map(h => {
+    const s = h.slot;
+    const label = h.end - h.start < 60 ? fmtRange(h.start, h.end) : fmtTime(h.start);
+    const pills = h.why.length
+      ? h.why.map(w => `<span class="pill ${PILL_CLASS[w]}">${w}</span>`).join('')
+      : '<span class="pill good">Good</span>';
+    const rain = s.missing ? '–'
+      : `${over(s.chance >= cfg.MAX_RAIN_CHANCE, s.chance + '%')} ` +
+        (s.rain >= cfg.RAIN_MM ? over(true, s.rain.toFixed(1)) : `<span class="dim">${s.rain.toFixed(1)}</span>`);
+    return `<tr>
+      <th scope="row">${label}</th>
+      <td>${over(s.wind >= cfg.MAX_WIND_KMH, whole(s.wind))}</td>
+      <td>${over(s.gust >= cfg.MAX_GUST_KMH, whole(s.gust))}</td>
+      <td>${rain}</td>
+      <td>${pills}<small>${courtText(s)}</small></td>
+    </tr>`;
+  }).join('');
+  return `<h4>${esc(title)}</h4>
+    <table>
+      <thead><tr><th scope="col">Hour</th><th scope="col">Wind</th><th scope="col">Gust</th><th scope="col">Rain</th><th scope="col">Status</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p class="note">Wind and gusts in km/h. Rain is chance, then mm for the hour.</p>`;
+}
+
+function nextWindow(model, c) {
+  for (const day of model) {
+    if (day.isToday) continue;
+    const w = day.clubs[c].windows[0];
+    if (w) return `${dayName(day.date)} ${fmtTime(w.start)}`;
+  }
+  return null;
+}
+
+function clubHtml(day, c, model) {
+  const cd = day.clubs[c], openKey = state.open.get(day.date), panel = 'detail-' + day.date;
+  const button = (key, cls, text) =>
+    `<button type="button" class="${cls}" data-day="${day.date}" data-key="${key}" aria-controls="${panel}" aria-expanded="${openKey === key}">${text}</button>`;
+  let body;
+  if (cd.windows.length) {
+    body = '<ul class="wins">' + cd.windows.map(w =>
+      `<li>${button(`${c}|e${w.end}`, 'chip', `<span>${fmtRange(w.start, w.end, w.fromNow)}</span>`)}</li>`).join('') + '</ul>';
+  } else {
+    const text = cd.over ? 'Done for today' : cd.hours.length ? (day.isToday ? 'Nothing left today' : 'No windows') : 'Not available';
+    const next = day.isToday ? nextWindow(model, c) : null;
+    body = `<p class="none">${text}</p>` + (next ? `<p class="next">Next: ${next}</p>` : '');
+  }
+  const all = cd.hours.length ? button(`${c}|all`, 'all', 'All hours') : '';
+  return `<div class="club"><h3>${esc(cd.club.name)}</h3>${body}${all}</div>`;
+}
+
+function dayHtml(day, d, model) {
+  const title = day.isToday ? 'Today' : d === 1 && model[0].isToday ? 'Tomorrow' : fmtDate(day.date);
+  const sub = title === fmtDate(day.date) ? '' : `<span class="date">${fmtDate(day.date)}${day.isToday ? ' · from now' : ''}</span>`;
+  const key = state.open.get(day.date);
+  let detail = '';
+  if (key) {
+    // A window is remembered by its end time, which stays put as "now" moves on.
+    const [c, which] = key.split('|'), cd = day.clubs[+c];
+    const w = cd.windows.find(x => 'e' + x.end === which);
+    if (which === 'all' && cd.hours.length) detail = detailHtml(`${cd.club.name} · all hours`, cd.hours, CONFIG);
+    else if (w) detail = detailHtml(`${cd.club.name} · ${fmtRange(w.start, w.end, w.fromNow)}`, w.hours, CONFIG);
+    if (!detail) state.open.delete(day.date);   // what was open has since passed
+  }
+  return `<section class="day${day.isToday ? ' today' : ''}">
+    <header><h2>${title}</h2>${sub}${day.tentative ? '<span class="badge">Tentative</span>' : ''}</header>
+    <div class="clubs">${day.clubs.map((_, c) => clubHtml(day, c, model)).join('')}</div>
+    <div class="detail" id="detail-${day.date}"${detail ? '' : ' hidden'}>${detail}</div>
+  </section>`;
+}
+
+function render() {
+  const btn = document.getElementById('refresh');
+  btn.disabled = state.loading;
+  btn.textContent = state.loading ? 'Updating…' : 'Refresh';
+  // A forecast kept from an earlier day says which day it is from.
+  const now = nzNow(CONFIG);
+  const when = (state.fetchedDate && state.fetchedDate !== now.date ? fmtDate(state.fetchedDate) + ', ' : '') + state.fetchedLabel;
+  document.getElementById('updated').textContent = state.fetchedLabel ? 'Updated ' + when : '';
+  if (!state.data) {
+    app.innerHTML = state.error
+      ? `<div class="state error"><p><strong>Couldn't load the forecast.</strong></p><p class="dim">${esc(state.error)}</p><p>Check your connection, then tap Refresh.</p></div>`
+      : '<div class="state"><p>Loading forecast…</p></div>';
+    return;
+  }
+  const model = buildModel(state.data, now, CONFIG);
+  const stale = state.error
+    ? `<div class="state error"><p><strong>Couldn't refresh</strong> — showing the forecast from ${when}.</p><p class="dim">${esc(state.error)}</p></div>`
+    : '';
+  app.innerHTML = stale + (model.length ? model.map(dayHtml).join('')
+    : '<div class="state"><p>This forecast is too old to cover today. Tap Refresh.</p></div>');
+}
+
+function renderFooter() {
+  const c = CONFIG;
+  document.getElementById('foot').innerHTML =
+    `Playable = wind under ${c.MAX_WIND_KMH} and gusts under ${c.MAX_GUST_KMH} km/h, rain under ${c.RAIN_MM} mm ` +
+    `with chance under ${c.MAX_RAIN_CHANCE}%, and a dry court, inside your hours. ` +
+    `Days ${c.TENTATIVE_FROM_DAY}–${c.FORECAST_DAYS} are tentative. ` +
+    'Weather data by <a href="https://open-meteo.com/">Open-Meteo.com</a>.';
+}
+
+// ------------------------------------------------------------------------ data
+function apiUrl(cfg) {
+  const q = new URLSearchParams({
+    latitude: cfg.CLUBS.map(c => c.lat).join(','),
+    longitude: cfg.CLUBS.map(c => c.lon).join(','),
+    hourly: 'wind_speed_10m,wind_gusts_10m,precipitation,precipitation_probability,relative_humidity_2m,cloud_cover',
+    daily: 'sunrise,sunset',
+    timezone: cfg.TIMEZONE,
+    wind_speed_unit: 'kmh',
+    forecast_days: cfg.FORECAST_DAYS,
+    past_days: cfg.PAST_DAYS,
+  });
+  return 'https://api.open-meteo.com/v1/forecast?' + q;
+}
+
+async function load() {
+  if (state.loading) return;
+  state.loading = true;
+  render();
+  try {
+    const res = await fetch(apiUrl(CONFIG), { cache: 'no-store' });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || data.error) throw new Error((data && data.reason) || `Open-Meteo answered ${res.status}`);
+    state.data = data;
+    state.error = null;
+    state.fetchedMs = Date.now();
+    const at = nzNow(CONFIG);
+    state.fetchedDate = at.date;
+    state.fetchedLabel = fmtTime(at.min);
+  } catch (err) {
+    state.error = err.message || String(err);
+  }
+  state.loading = false;
+  render();
+}
+
+// ------------------------------------------------------------------- self-test
+// Open the page with ?test on the end of the address to run these. They use
+// their own copy of the original rules, so changing CONFIG does not break them.
+function runSelfTest() {
+  const talavera = { name: 'Talavera', closes: '21:30', closesOn: {} };
+  const lowerHutt = { name: 'Lower Hutt', closes: '22:00', closesOn: { Sun: 'sunset' } };
+  const T = Object.freeze({
+    CLUBS: [talavera, lowerHutt], TIMEZONE: 'Pacific/Auckland', FORECAST_DAYS: 7, TENTATIVE_FROM_DAY: 4,
+    AVAILABILITY: {
+      Mon: ['17:30', '22:00'], Tue: ['17:30', '22:00'], Wed: ['17:00', '22:00'], Thu: ['17:30', '22:00'],
+      Fri: ['17:00', '22:00'], Sat: ['08:00', '22:00'], Sun: ['08:00', '22:00'],
+    },
+    MAX_WIND_KMH: 25, MAX_GUST_KMH: 35, RAIN_MM: 0.1, MAX_RAIN_CHANCE: 30,
+    DRY_LIGHT_BELOW_MM: 1, DRY_HEAVY_ABOVE_MM: 5, DRY_POINTS_LIGHT: 1, DRY_POINTS_MEDIUM: 2, DRY_POINTS_HEAVY: 3,
+    DRY_BASE: 1, DRY_WIND_AT_KMH: 15, DRY_WIND_BONUS: 0.5, DRY_CLEAR_BELOW_PCT: 50, DRY_CLEAR_BONUS: 0.5,
+    DRY_HUMID_ABOVE_PCT: 85, DRY_HUMID_PENALTY: 0.5, DRY_NIGHT_FACTOR: 0.5,
+  });
+  const MON = '2026-10-05', WED = '2026-10-07', SAT = '2026-10-10', SUN = '2026-10-11';
+
+  const results = [];
+  const check = (group, name, expected, got) =>
+    results.push({ group, name, expected: String(expected), got: String(got), pass: String(expected) === String(got) });
+
+  // A calm, cloudy, dry daytime hour on a dry court; override what the case needs.
+  const slot = (o = {}) => ({
+    date: WED, start: 720, wind: 10, gust: 20, rain: 0, chance: 0, humidity: 70, cloud: 80,
+    night: false, missing: false, court: 'dry', ...o,
+  });
+  const verdict = s => blockers(s, T).join(' + ') || 'Good';
+
+  let g = 'Playable hour';
+  check(g, 'wind 24.9, gusts 34.9, 0 mm, 29% chance, dry court', 'Good', verdict(slot({ wind: 24.9, gust: 34.9, chance: 29 })));
+  check(g, 'wind exactly 25', 'Windy', verdict(slot({ wind: 25 })));
+  check(g, 'gusts exactly 35 (wind 12)', 'Windy', verdict(slot({ wind: 12, gust: 35 })));
+  check(g, 'rain 0.09 mm, 10% chance', 'Good', verdict(slot({ rain: 0.09, chance: 10 })));
+  check(g, 'rain exactly 0.1 mm', 'Rain', verdict(slot({ rain: 0.1, chance: 60, court: 'wet' })));
+  check(g, 'rain chance exactly 30%, 0 mm', 'Rain risk', verdict(slot({ chance: 30 })));
+  check(g, 'fine weather but court still drying', 'Drying', verdict(slot({ court: 'drying' })));
+  check(g, 'gusty and court still drying', 'Windy + Drying', verdict(slot({ gust: 48, court: 'drying' })));
+
+  g = 'Points needed';
+  check(g, 'wet spell of 0.99 mm', 1, pointsNeeded(0.99, T));
+  check(g, 'wet spell of 1.0 mm (0.1 + 0.2 + 0.7)', 2, pointsNeeded(0.1 + 0.2 + 0.7, T));
+  check(g, 'wet spell of 5.0 mm', 2, pointsNeeded(5, T));
+  check(g, 'wet spell of 5.01 mm', 3, pointsNeeded(5.01, T));
+
+  g = 'Points per dry hour';
+  check(g, 'day, wind 10, cloud 80%, humidity 70%', 1, dryingPoints(slot(), T));
+  check(g, 'day, wind 15, cloud 49%, humidity 70%', 2, dryingPoints(slot({ wind: 15, cloud: 49 }), T));
+  check(g, 'day, wind 14.9, cloud 50%, humidity 85% (all just miss)', 1, dryingPoints(slot({ wind: 14.9, cloud: 50, humidity: 85 }), T));
+  check(g, 'day, wind 10, cloud 80%, humidity 86%', 0.5, dryingPoints(slot({ humidity: 86 }), T));
+  check(g, 'after sunset, wind 10, cloud 80%, humidity 86%', 0.25, dryingPoints(slot({ humidity: 86, night: true }), T));
+  check(g, 'after sunset, wind 20, cloud 20%, humidity 60%', 1, dryingPoints(slot({ wind: 20, cloud: 20, humidity: 60, night: true }), T));
+
+  // Hour-by-hour sequences. calm = 1 pt/h, brisk = 2 pt/h, dank = 0.25 pt/h.
+  const calm = {}, brisk = { wind: 20, cloud: 20 }, dank = { humidity: 90, night: true };
+  const rain = mm => ({ rain: mm, chance: 90 });
+  const squash = list => list
+    .reduce((runs, v) => {
+      const last = runs[runs.length - 1];
+      if (last && last.v === v) last.n++; else runs.push({ v, n: 1 });
+      return runs;
+    }, [])
+    .map(r => (r.n > 1 ? `${r.v} ×${r.n}` : r.v)).join(', ');
+  const sequence = (...hours) => {
+    const slots = hours.map((o, i) => slot({ start: i * 60, court: undefined, ...o }));
+    applyDrying(slots, T);
+    return squash(slots.map(verdict));
+  };
+
+  g = 'Drying over time';
+  check(g, '0.5 mm shower, then calm cloudy day hours (needs 1, earns 1/h)',
+    'Rain, Drying, Good ×2', sequence(rain(0.5), calm, calm, calm));
+  check(g, '3 mm over two hours, then breezy clear hours (needs 2, earns 2/h)',
+    'Rain ×2, Drying, Good', sequence(rain(1.5), rain(1.5), brisk, brisk));
+  check(g, '3 mm, then calm cloudy day hours (needs 2, earns 1/h)',
+    'Rain, Drying ×2, Good', sequence(rain(3), calm, calm, calm));
+  check(g, '8 mm, then humid hours after sunset (needs 3, earns 0.25/h)',
+    'Rain, Drying ×12, Good', sequence(rain(8), ...Array(13).fill(dank)));
+  check(g, '4 mm, one drying hour, 2 mm more (totals combine: 6 mm needs 3)',
+    'Rain, Drying, Rain, Drying ×3, Good', sequence(rain(4), calm, rain(2), calm, calm, calm, calm));
+  check(g, '6 mm, court dries fully, then a new 0.3 mm shower (needs only 1)',
+    'Rain, Drying ×3, Good, Rain, Drying, Good', sequence(rain(6), calm, calm, calm, calm, rain(0.3), calm, calm));
+  check(g, '0.5 mm, then a dry hour with 50% rain chance (blocked, but still dries)',
+    'Rain, Rain risk + Drying, Good', sequence(rain(0.5), { chance: 50 }, calm));
+
+  // Whole days: every hour is good unless overridden by hour number.
+  const sun = date => ({ [date]: { rise: 6 * 60 + 45, set: 19 * 60 + 33 } });
+  const dayOf = (date, by = {}) => Array.from({ length: 24 }, (_, h) => slot({ date, start: h * 60, ...(by[h] || {}) }));
+  const windows = (date, club, by, now = { date: '', min: 0 }) =>
+    clubDay(date, club, dayOf(date, by), sun(date), now, T)
+      .windows.map(w => fmtRange(w.start, w.end, w.fromNow)).join(', ') || 'none';
+  const gusty = { gust: 50 };
+
+  g = 'Windows';
+  check(g, 'Monday, fine all day — Talavera (closes 9:30pm)', '5:30–9:30pm', windows(MON, talavera));
+  check(g, 'Monday, fine all day — Lower Hutt', '5:30–10pm', windows(MON, lowerHutt));
+  check(g, 'Wednesday, fine all day — Lower Hutt', '5–10pm', windows(WED, lowerHutt));
+  check(g, 'Saturday, fine all day — Talavera', '8am–9:30pm', windows(SAT, talavera));
+  check(g, 'Sunday, fine all day — Lower Hutt (no lights, sunset 7:33pm)', '8am–7:33pm', windows(SUN, lowerHutt));
+  check(g, 'Sunday, fine all day — Talavera', '8am–9:30pm', windows(SUN, talavera));
+  check(g, 'Wednesday, gusty 7–8pm only — Lower Hutt', '5–7pm, 8–10pm', windows(WED, lowerHutt, { 19: gusty }));
+  check(g, 'Monday, gusty from 6pm — Talavera (30-minute window)', '5:30–6pm',
+    windows(MON, talavera, { 18: gusty, 19: gusty, 20: gusty, 21: gusty }));
+  check(g, 'Wednesday, gusty all evening — Lower Hutt', 'none',
+    windows(WED, lowerHutt, { 17: gusty, 18: gusty, 19: gusty, 20: gusty, 21: gusty }));
+  check(g, 'Wednesday at 6:40pm, fine — Lower Hutt (today, what is left)', 'Now–10pm',
+    windows(WED, lowerHutt, {}, { date: WED, min: 18 * 60 + 40 }));
+  check(g, 'Wednesday at 9:45pm, fine — Talavera (already closed)', 'none',
+    windows(WED, talavera, {}, { date: WED, min: 21 * 60 + 45 }));
+
+  g = 'Forecast timing';
+  const fakeLoc = {
+    hourly: {
+      time: ['16:00', '17:00', '18:00', '19:00'].map(t => WED + 'T' + t),
+      wind_speed_10m: [10, 20, 30, 30], wind_gusts_10m: [20, 20, 44, 30],
+      precipitation: [0, 0, 2, 0], precipitation_probability: [0, 0, 80, 10],
+      relative_humidity_2m: [70, 70, 70, 70], cloud_cover: [80, 80, 80, 80],
+    },
+    daily: { time: [WED], sunrise: [WED + 'T06:45'], sunset: [WED + 'T19:33'] },
+  };
+  const fake = buildSlots(fakeLoc, T).slots;
+  check(g, 'rain and gusts in the 6pm row belong to the 5–6pm hour; wind is the 5pm/6pm average',
+    '4pm: 0 mm, gust 20, wind 15 | 5pm: 2 mm, gust 44, wind 25 | 6pm: 0 mm, gust 30, wind 30',
+    fake.map(s => `${fmtTime(s.start)}: ${s.rain} mm, gust ${s.gust}, wind ${s.wind}`).join(' | '));
+  check(g, 'sunset 7:33pm: the 7–8pm hour counts as day, 8–9pm as night', 'day, night',
+    [19, 20].map(h => buildSlots({
+      hourly: {
+        time: [WED + `T${h}:00`, WED + `T${h + 1}:00`], wind_speed_10m: [1, 1], wind_gusts_10m: [1, 1],
+        precipitation: [0, 0], precipitation_probability: [0, 0], relative_humidity_2m: [1, 1], cloud_cover: [1, 1],
+      },
+      daily: { time: [WED], sunrise: [WED + 'T06:45'], sunset: [WED + 'T19:33'] },
+    }, T).slots[0].night ? 'night' : 'day').join(', '));
+
+  // What Open-Meteo sends when asked on Sat 3 Apr 2027, the day before clocks go
+  // back: every row stamped +13:00, although from the 4th the real clock is +12:00.
+  const across = day => {
+    const r = buildSlots({
+      utc_offset_seconds: 46800,
+      hourly: {
+        time: [day + 'T18:00', day + 'T19:00'], wind_speed_10m: [1, 1], wind_gusts_10m: [1, 1],
+        precipitation: [0, 0], precipitation_probability: [0, 0], relative_humidity_2m: [1, 1], cloud_cover: [1, 1],
+      },
+      daily: { time: [day], sunrise: [day + 'T07:40'], sunset: [day + 'T19:06'] },
+    }, T);
+    return `${r.slots[0].date} ${fmtTime(r.slots[0].start)}, sunset ${fmtTime(r.sun[day].set)}`;
+  };
+  check(g, 'daylight saving: a row stamped 6pm on the day before clocks go back is 6pm',
+    '2027-04-03 6pm, sunset 7:06pm', across('2027-04-03'));
+  check(g, 'daylight saving: a row stamped 6pm on the day after is really 5pm, sunset 6:06pm',
+    '2027-04-05 5pm, sunset 6:06pm', across('2027-04-05'));
+
+  g = 'Old forecast';
+  const days = m => (m.length ? `${m.length} day from ${m[0].date}` : 'no days (too old)');
+  check(g, 'forecast covering Wednesday, opened that Wednesday', '1 day from 2026-10-07',
+    days(buildModel([fakeLoc, fakeLoc], { date: WED, min: 600 }, T)));
+  check(g, 'same forecast reopened on Friday with no connection', 'no days (too old)',
+    days(buildModel([fakeLoc, fakeLoc], { date: '2026-10-09', min: 600 }, T)));
+
+  return results;
+}
+
+function renderSelfTest() {
+  const results = runSelfTest();
+  const passed = results.filter(r => r.pass).length;
+  let group = '';
+  const rows = results.map((r, i) => {
+    const head = r.group === group ? '' : `<tr><th colspan="4">${esc(group = r.group)}</th></tr>`;
+    return `${head}<tr><td>${i + 1}. ${esc(r.name)}</td><td>${esc(r.expected)}</td><td>${esc(r.got)}</td>` +
+      `<td class="${r.pass ? 'pass' : 'fail'}">${r.pass ? 'PASS' : 'FAIL'}</td></tr>`;
+  }).join('');
+  document.getElementById('refresh').hidden = true;
+  document.getElementById('updated').textContent = 'Self-test of the playability and drying rules';
+  app.innerHTML = `<div class="state"><p><strong class="${passed === results.length ? 'pass' : 'fail'}">${passed} of ${results.length} passed</strong></p></div>
+    <div class="day"><table class="tests">
+      <thead><tr><th scope="col">Case</th><th scope="col">Expected</th><th scope="col">Got</th><th scope="col">Result</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+// ----------------------------------------------------------------------- start
+app.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-key]');
+  if (!btn) return;
+  const { day, key } = btn.dataset;
+  if (state.open.get(day) === key) state.open.delete(day); else state.open.set(day, key);
+  render();
+  const again = app.querySelector(`button[data-day="${day}"][data-key="${key}"]`);
+  if (again) again.focus();
+});
+
+if (new URLSearchParams(location.search).has('test')) {
+  renderSelfTest();
+} else {
+  renderFooter();
+  document.getElementById('refresh').addEventListener('click', load);
+  // Phones keep pages alive in the background, so coming back counts as opening.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    if (Date.now() - state.fetchedMs > CONFIG.REFRESH_AFTER_MIN * 60000) load(); else render();
+  });
+  window.addEventListener('pageshow', e => { if (e.persisted) load(); });
+  load();
+}
+</script>
+</body>
+</html>
