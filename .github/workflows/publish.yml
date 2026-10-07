@@ -1,0 +1,170 @@
+name: Check and publish
+
+# Every change to main is checked, and only a change that passes is published,
+# under the next version number. "Run workflow" with a version number puts that
+# version's page (and the check that went with it) back, as a new version.
+# Pull requests are only checked.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      restore:
+        description: 'Version to put back, e.g. v1.0 (leave empty to just publish again)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('check-{0}', github.ref) || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+      restore: ${{ steps.pin.outputs.restore }}
+    steps:
+      # Publishing only happens from main, so say so instead of ending with a green tick.
+      - name: Run workflow only works on main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Nothing was published, because the branch box was not left on main. Tap Run workflow again and leave it on main."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: pin
+        name: Pick what to check
+        env:
+          RESTORE: ${{ inputs.restore }}
+        run: |
+          tag=$(printf '%s' "$RESTORE" | tr -d '[:space:]' | tr 'V' 'v')
+          if [ -n "$tag" ]; then
+            case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+            if ! printf '%s\n' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+'; then
+              echo "::error::That is not a version number. Type it like v1.0"; exit 1
+            fi
+            if ! git cat-file -e "refs/tags/$tag:index.html" 2>/dev/null || ! git cat-file -e "refs/tags/$tag:checks/check.mjs" 2>/dev/null; then
+              echo "::error::There is no version called $tag. The Releases page lists them."; exit 1
+            fi
+            # A page is checked by the check that was published with it. Only this
+            # run's working copy changes here; nothing is pushed yet.
+            git checkout "refs/tags/$tag" -- index.html checks/check.mjs
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "restore=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check the page
+        env:
+          RESTORING: ${{ steps.pin.outputs.restore }}
+        run: node checks/check.mjs
+
+  publish:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      # Exactly the commit that was checked, even if main has moved on since.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/configure-pages@v6
+
+      - id: version
+        name: Reserve the next version number
+        env:
+          RESTORE: ${{ needs.check.outputs.restore }}
+        run: |
+          set -euo pipefail
+          last=$(git tag --list 'v*' --sort=-v:refname | { grep -Ex 'v[0-9]+\.[0-9]+' || true; } | sed -n 1p)
+          if [ -n "$last" ] && ! git merge-base --is-ancestor "$last" HEAD; then
+            echo "::error::This run is older than $last, so nothing was changed. To put a version back, or to try publishing again, use Run workflow."
+            exit 1
+          fi
+
+          restored=
+          if [ -n "$RESTORE" ]; then
+            git checkout "refs/tags/$RESTORE" -- index.html checks/check.mjs
+            if ! git diff --cached --quiet; then
+              git -c user.name="github-actions[bot]" \
+                  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  commit -q -m "Restore $RESTORE"
+              restored=1
+            fi
+          fi
+
+          if [ -z "$last" ]; then
+            next=v1.0
+          else
+            major=${last#v}; major=${major%%.*}
+            next="v${major}.$(( 10#${last##*.} + 1 ))"
+          fi
+
+          # The tag goes up before publishing, so a number can never be used twice.
+          git tag "$next"
+          if [ -n "$restored" ]; then
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/$next" || {
+              echo "::error::main changed while this was running. Nothing was published. Press Run workflow again."; exit 1; }
+          else
+            git push origin "refs/tags/$next"
+          fi
+
+          {
+            echo "v=$next"
+            echo "last=$last"
+            echo "date=$(TZ=Pacific/Auckland date '+%-d %b %Y')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the version into the published copy
+        env:
+          STAMP: ${{ steps.version.outputs.v }} · ${{ steps.version.outputs.date }}
+        run: |
+          mkdir _site
+          sed "s/const VERSION = 'dev';/const VERSION = '$STAMP';/" index.html > _site/index.html
+          grep -qF "const VERSION = '$STAMP';" _site/index.html || {
+            echo "::error::index.html has no VERSION line to stamp"; exit 1; }
+
+      # Named per attempt: a re-run would otherwise trip over the first attempt's upload.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          name: github-pages-${{ github.run_attempt }}
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
+
+      - name: Record the version in Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.version.outputs.v }}
+          LAST: ${{ steps.version.outputs.last }}
+        run: |
+          # Notes run from the newest version on the Releases page, not from the newest
+          # tag: a tag whose publish failed half-way never got a release.
+          base=$(gh release list --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName // empty') || base=$LAST
+          if [ -n "$base" ] && ! git merge-base --is-ancestor "$base" HEAD 2>/dev/null; then base=$LAST; fi
+          notes=$(git log --format='- %s' ${base:+"$base.."}HEAD | sed -n 1,50p)
+          gh release create "$V" --verify-tag --title "$V" --notes "${notes:-Published again with no changes.}"
